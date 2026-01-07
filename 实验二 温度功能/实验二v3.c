@@ -1,0 +1,652 @@
+#include "LPC11xx.h"
+#include <stdio.h>
+#include <string.h>
+
+// 引脚定义
+#define FLASH_CS_HIGH()   LPC_GPIO2->DATA |= (1<<0)
+#define FLASH_CS_LOW()    LPC_GPIO2->DATA &= ~(1<<0)
+
+// Flash指令
+#define FLASH_WriteEnable  0x06 
+#define FLASH_ReadStatusReg  0x05 
+#define FLASH_ReadData  0x03 
+#define FLASH_PageProgram  0x02 
+#define FLASH_SectorErase  0x20 
+#define FLASH_ChipErase  0xC7 
+
+// 全局变量
+volatile uint16_t adc_value = 0;
+volatile uint8_t adc_data_ready = 0;
+volatile uint8_t flash_data_ready = 0;
+volatile uint8_t uart_command = 0;
+uint32_t flash_address = 0;
+uint16_t record_count = 0;
+int16_t last_raw_temp;
+
+// NTC温度查找表
+typedef struct {
+    int16_t temp;
+    uint16_t resistance;
+} ntc_table_t;
+
+// NTC温度查找表 - 基于规格书R-T表（10kΩ @ 25°C, B=3950K）
+const ntc_table_t ntc_table[] = {
+    {0, 32814}, {10, 19958}, {20, 12504}, {25, 10000},
+    {30, 8049}, {40, 5313}, {50, 3586}, {60, 2472},
+    {70, 1742}, {80, 1249}, {90, 911}, {100, 675},
+    {110, 508}, {120, 388}, {125, 341}
+};
+const uint8_t ntc_table_size = 19;
+
+// 函数声明
+void UART_Init(void);
+void ADC_Init(void);
+void TIMER32B0_Init(void);
+void TIMER32B1_Init(void);
+void GPIO_Init(void);
+void SPI_Init(void);
+void Flash_Init(void);
+void I2C_Init(void);
+void UART_SendString(char *str);
+void UART_SendByte(uint8_t data);
+void SendNumber(uint16_t num);
+void SendFloat(float value, uint8_t decimals);
+uint8_t SPI_ExchangeByte(uint8_t tx_data);
+uint8_t Flash_ReadStatus(void);
+void Flash_WriteEnable(void);
+void Flash_WaitBusy(void);
+void Flash_ReadData(uint8_t* buffer, uint32_t address, uint16_t length);
+void Flash_WritePage(uint8_t* data, uint32_t address, uint16_t length);
+void Flash_EraseChip(void);
+void I2C_Start(void);
+void I2C_Stop(void);
+void I2C_SendByte(uint8_t data);
+uint8_t I2C_ReceiveByte(void);
+int16_t ReadRawTemperature(void);
+float ConvertToCelsius(int16_t raw_temp);
+void SaveTemperatureData(int16_t raw_temp);
+void DisplayAllRecords(void);
+void ProcessUARTCommand(void);
+float ADC_To_Temperature(uint16_t adc_value);
+
+
+/************************UART函数*************************/
+void UART_Init(void) {
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1UL << 16); /* enable clock for IOCON */
+    
+    // 配置P1.6为RXD，P1.7为TXD
+    LPC_IOCON->PIO1_6 &= ~0x07;  // 清除功能位
+    LPC_IOCON->PIO1_6 |= 0x01;   /* P1.6 is RxD */
+    LPC_IOCON->PIO1_7 &= ~0x07;  // 清除功能位
+    LPC_IOCON->PIO1_7 |= 0x01;   /* P1.7 is TxD */
+    
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1UL << 12); /* Enable clock to UART */
+    LPC_SYSCON->UARTCLKDIV = 4; /* UART clock = 48MHz / 4 = 12MHz */
+    
+    // 设置波特率：DLAB=1，允许访问DLL/DLM
+    LPC_UART->LCR = 0x83; /* 8 bits, 1 Stop bit, DLAB=1 */
+    
+    // 设置波特率参数
+    LPC_UART->DLL = 4;     /* 115200 Baud Rate @ 12.0 MHz PCLK */
+    LPC_UART->FDR = 0x85;  /* FR 0.615, DIVADDVAL=5, MULVAL=8 */
+    LPC_UART->DLM = 0;     /* High divisor latch = 0 */
+    
+    // 设置通信参数：8位数据，奇校验，1位停止位，DLAB=0
+    LPC_UART->LCR = 0x0B;  /* 8 bits, Odd Parity, 1 Stop bit, DLAB=0 */
+    
+    // 使能FIFO并设置触发点
+    LPC_UART->FCR = 0x81;  /* 使能FIFO，接收触发点为1字节 */
+    
+    // 使能接收中断
+    LPC_UART->IER = 0x01;
+		
+		    // 使能UART中断
+    NVIC_EnableIRQ(UART_IRQn);
+}
+
+void UART_SendString(char *str) {
+    while(*str) {
+        UART_SendByte(*str++);
+    }
+}
+
+void UART_SendByte(uint8_t data) {
+    while((LPC_UART->LSR & (1UL << 5)) == 0); // 等待THRE为空
+    LPC_UART->THR = data;
+}
+
+void SendNumber(uint16_t num) {
+    char buffer[6];
+    uint8_t i = 0;
+    
+    if(num == 0) {
+        UART_SendByte('0');
+        return;
+    }
+    
+    // 将数字转换为字符串
+    while(num > 0) {
+        buffer[i++] = '0' + (num % 10);
+        num /= 10;
+    }
+    
+    // 反向发送
+    while(i > 0) {
+        UART_SendByte(buffer[--i]);
+    }
+}
+
+void SendFloat(float value, uint8_t decimals) {
+    // 发送整数部分
+    int integer_part = (int)value;
+    if (integer_part < 0) {
+        UART_SendByte('-');
+        integer_part = -integer_part;
+        value = -value;
+    }
+    SendNumber(integer_part);
+    
+    if(decimals > 0) {
+        UART_SendByte('.');
+        
+        // 发送小数部分
+        float fractional = value - (int)value;
+        for(uint8_t i = 0; i < decimals; i++) {
+            fractional *= 10;
+            int digit = (int)fractional;
+            UART_SendByte('0' + digit);
+            fractional -= digit;
+        }
+    }
+}
+
+/************************ADC函数*************************/
+void ADC_Init(void) {
+    // 使能IOCON和ADC时钟
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1UL << 6) | (1UL << 16) | (1UL << 13);
+    
+    // 配置P1.11为AD7模拟输入
+    LPC_IOCON->PIO1_11 &= ~0x07;  // 清除功能位
+    LPC_IOCON->PIO1_11 = 0x01;   // 设置为ADC功能，模拟输入
+    
+    // 确保GPIO方向为输入
+    LPC_GPIO1->DIR &= ~(1UL << 11);
+    
+    // ADC电源使能
+    LPC_SYSCON->PDRUNCFG &= ~(1UL << 4);
+    
+    // ADC时钟分频和通道选择
+    LPC_ADC->CR = (11UL << 8) |    // CLKDIV = 11
+                  (1UL << 7);      // 选择AD7通道
+    
+    // 使能AD7通道中断
+    LPC_ADC->INTEN = (1UL << 7);
+    
+    // NVIC中断使能
+    NVIC_EnableIRQ(ADC_IRQn);
+}
+
+
+// 更正的ADC转温度函数，version2
+float ADC_To_Temperature(uint16_t adc_value) {
+    if (adc_value == 0 || adc_value >= 1023) {
+        return 99.0f; // 无效值
+    }
+
+    // 计算NTC电阻值（使用10k上拉电阻）
+    float voltage = (adc_value * 3.3f) / 1023.0f;
+    float ntc_resistance = (3.3f - voltage) * 10000.0f / voltage;
+    
+    // 将电阻值转换为kΩ单位以匹配查找表
+    float ntc_resistance_kohm = ntc_resistance / 1000.0f;
+
+    // 查找相邻点进行线性插值
+    for (uint8_t i = 0; i < ntc_table_size - 1; i++) {
+        if (ntc_resistance_kohm <= ntc_table[i].resistance && 
+            ntc_resistance_kohm >= ntc_table[i + 1].resistance) {
+            
+            // 线性插值
+            float temp1 = ntc_table[i].temp;
+            float temp2 = ntc_table[i + 1].temp;
+            float R1 = ntc_table[i].resistance;
+            float R2 = ntc_table[i + 1].resistance;
+            
+            return temp1 + (ntc_resistance_kohm - R1) * (temp2 - temp1) / (R2 - R1);
+        }
+    }
+
+    // 超出表格范围的处理
+    if (ntc_resistance_kohm > ntc_table[0].resistance) {
+        return 0.0f;// 温度过低
+    } else {
+        return 99.0f;// 温度过高
+    }
+}
+
+
+/************************定时器初始化*************************/
+// 32位定时器0初始化 - 1秒定时，用于触发ADC转换
+void TIMER32B0_Init(void) {
+    // 使能定时器0时钟
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1UL << 9);
+    
+    // 清除所有中断标志
+    LPC_TMR32B0->IR = 0x1F;
+    
+    // 预分频设置 (48MHz/48000 = 1kHz)
+    LPC_TMR32B0->PR = 47999;  // 48000分频
+    
+    // 匹配寄存器 - 1秒定时 (1kHz * 1000 = 1秒)
+    LPC_TMR32B0->MR0 = 1000;
+    
+    // 匹配控制：中断 + 复位
+    LPC_TMR32B0->MCR = (1UL << 0) | (1UL << 1);
+    
+    // 启动定时器
+    LPC_TMR32B0->TCR = 0x01;
+    
+    // NVIC中断使能
+    NVIC_EnableIRQ(TIMER_32_0_IRQn);
+}
+
+// 32位定时器1初始化 - 1秒定时，用于读取LM75温度并存储到Flash
+void TIMER32B1_Init(void) {
+    // 使能定时器1时钟
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1UL << 10);
+    
+    // 清除所有中断标志
+    LPC_TMR32B1->IR = 0x1F;
+    
+    // 预分频设置 (48MHz/48000 = 1kHz)
+    LPC_TMR32B1->PR = 47999;  // 48000分频
+    
+    // 匹配寄存器 - 1秒定时 (1kHz * 1000 = 1秒)
+    LPC_TMR32B1->MR0 = 1000;
+    
+    // 匹配控制：中断 + 复位
+    LPC_TMR32B1->MCR = (1UL << 0) | (1UL << 1);
+    
+    // 启动定时器
+    LPC_TMR32B1->TCR = 0x01;
+    
+    // NVIC中断使能
+    NVIC_EnableIRQ(TIMER_32_1_IRQn);
+}
+
+/************************SPI和Flash函数*************************/
+uint8_t SPI_ExchangeByte(uint8_t tx_data)
+{  
+    while((LPC_SSP1->SR & (1<<4)) == (1<<4));  // 等待不忙
+    LPC_SSP1->DR = tx_data;
+    while((LPC_SSP1->SR & (1<<2)) != (1<<2));  // 等待接收完成
+    return LPC_SSP1->DR;
+}
+
+void SPI_Init(void)
+{
+    uint8_t i;
+    
+    // 使能SSP1时钟
+    LPC_SYSCON->PRESETCTRL |= (1<<2);
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1<<18);
+    LPC_SYSCON->SSP1CLKDIV = 0x06;
+    
+    // 配置SPI引脚
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1<<16);
+    LPC_IOCON->PIO2_1 = 0x02;  // SCK
+    LPC_IOCON->PIO2_2 = 0x02;  // MISO  
+    LPC_IOCON->PIO2_3 = 0x02;  // MOSI
+    LPC_SYSCON->SYSAHBCLKCTRL &= ~(1<<16);
+    
+    // 配置SSP1
+    LPC_SSP1->CR0 = 0x01C7;  // 8位数据，SPI模式0
+    LPC_SSP1->CPSR = 0x04;   // 预分频
+    LPC_SSP1->CR1 = (1<<1);  // 使能SSP
+    
+    // 清空FIFO
+    for(i = 0; i < 8; i++)
+    {
+        volatile uint8_t clear = LPC_SSP1->DR;
+    }   
+}
+
+void Flash_Init(void)
+{
+    LPC_GPIO2->DIR |= (1<<0);
+    FLASH_CS_HIGH();
+    SPI_Init();
+}  
+
+uint8_t Flash_ReadStatus(void)
+{  
+    uint8_t status;
+    FLASH_CS_LOW();
+    SPI_ExchangeByte(FLASH_ReadStatusReg);
+    status = SPI_ExchangeByte(0xFF);
+    FLASH_CS_HIGH();
+    return status;
+}
+
+void Flash_WriteEnable(void)
+{
+    FLASH_CS_LOW();
+    SPI_ExchangeByte(FLASH_WriteEnable);
+    FLASH_CS_HIGH();
+}
+
+void Flash_WaitBusy(void)
+{   
+    while((Flash_ReadStatus() & 0x01) == 0x01);
+}
+
+void Flash_ReadData(uint8_t* buffer, uint32_t address, uint16_t length)
+{ 
+    uint16_t i;  
+    FLASH_CS_LOW();
+    SPI_ExchangeByte(FLASH_ReadData);
+    SPI_ExchangeByte((uint8_t)(address >> 16));
+    SPI_ExchangeByte((uint8_t)(address >> 8));   
+    SPI_ExchangeByte((uint8_t)address);   
+    for(i = 0; i < length; i++)
+    { 
+        buffer[i] = SPI_ExchangeByte(0xFF);
+    }
+    FLASH_CS_HIGH();
+}  
+
+void Flash_WritePage(uint8_t* data, uint32_t address, uint16_t length)
+{
+    uint16_t i;  
+    Flash_WriteEnable();
+    FLASH_CS_LOW();
+    SPI_ExchangeByte(FLASH_PageProgram);
+    SPI_ExchangeByte((uint8_t)(address >> 16));
+    SPI_ExchangeByte((uint8_t)(address >> 8));   
+    SPI_ExchangeByte((uint8_t)address);   
+    for(i = 0; i < length; i++)
+    {
+        SPI_ExchangeByte(data[i]);
+    }
+    FLASH_CS_HIGH();
+    Flash_WaitBusy();
+} 
+
+void Flash_EraseChip(void)
+{   
+    Flash_WriteEnable();
+    Flash_WaitBusy();   
+    FLASH_CS_LOW();
+    SPI_ExchangeByte(FLASH_ChipErase);
+    FLASH_CS_HIGH();
+    Flash_WaitBusy();
+}
+
+/************************I2C温度传感器函数*************************/
+void I2C_Init(void)
+{
+    // 使能I2C
+    LPC_SYSCON->PRESETCTRL |= (1<<1);
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1<<5);
+    
+    // 配置I2C引脚
+    LPC_SYSCON->SYSAHBCLKCTRL |= (1<<16);
+    LPC_IOCON->PIO0_4 = 0x01;  // SDA
+    LPC_IOCON->PIO0_5 = 0x01;  // SCL
+    LPC_SYSCON->SYSAHBCLKCTRL &= ~(1<<16);
+    
+    // 100kHz
+    LPC_I2C->SCLH = 250;
+    LPC_I2C->SCLL = 250;
+    
+    LPC_I2C->CONCLR = 0xFF;
+    LPC_I2C->CONSET |= (1<<6);  // 使能I2C
+}
+
+void I2C_Start(void)
+{
+    LPC_I2C->CONSET |= (1<<5);
+    while(!(LPC_I2C->CONSET & (1<<3)));
+    LPC_I2C->CONCLR = (1<<5) | (1<<3);
+}
+
+void I2C_Stop(void)
+{
+    LPC_I2C->CONCLR = (1<<3);
+    LPC_I2C->CONSET |= (1<<4);
+    while(LPC_I2C->CONSET & (1<<4));
+}
+
+void I2C_SendByte(uint8_t data)
+{
+    uint16_t timeout = 20000;
+    LPC_I2C->DAT = data;
+    LPC_I2C->CONCLR = (1<<3);
+    while((!(LPC_I2C->CONSET & (1<<3))) && (timeout--));  
+}
+
+uint8_t I2C_ReceiveByte(void)
+{
+    uint8_t data;
+    uint16_t timeout = 20000;
+    LPC_I2C->CONSET = (1<<2);
+    LPC_I2C->CONCLR = (1<<3);
+    while((!(LPC_I2C->CONSET & (1<<3))) && (timeout--));  
+    data = (uint8_t)LPC_I2C->DAT;
+    return data;
+}
+
+// 读取原始温度数据（16位）
+int16_t ReadRawTemperature(void)
+{  
+    uint8_t high_byte, low_byte;
+    int16_t raw_temp;
+    
+    I2C_Start();   
+    I2C_SendByte(0x91);  // LM75地址 + 读  
+    high_byte = I2C_ReceiveByte();   
+    low_byte = I2C_ReceiveByte(); 
+    I2C_Stop();  
+    
+    raw_temp = (high_byte << 8) | low_byte;
+    return raw_temp;
+}
+
+// 原始数据转摄氏度
+float ConvertToCelsius(int16_t raw_temp)
+{
+    int16_t temp_data = raw_temp >> 5;
+    
+    if(temp_data & 0x0400) {
+        // 负数处理
+        temp_data = -(~(temp_data & 0x03FF) + 1);
+    }
+    
+    return temp_data * 0.125f;
+}
+
+/************************温度记录功能*************************/
+// 保存原始温度数据到Flash
+void SaveTemperatureData(int16_t raw_temp)
+{
+    uint8_t temp_data[2];
+    
+    // 将16位温度数据拆分为2个字节
+    temp_data[0] = (raw_temp >> 8) & 0xFF;  // 高字节
+    temp_data[1] = raw_temp & 0xFF;         // 低字节
+    
+    Flash_WritePage(temp_data, flash_address, 2);
+    
+    flash_address += 2;
+    record_count++;
+    
+    // 防止地址溢出
+    if(flash_address >= 0x1FFFE)
+    {
+        flash_address = 0;
+        UART_SendString("Flash address reset to 0\r\n");
+    }
+}
+
+// 读取并显示所有温度记录
+void DisplayAllRecords(void)
+{
+    uint8_t temp_data[2];
+    int16_t raw_temp;
+    float temp_c;
+    uint32_t address = 0;
+    uint16_t i;
+    
+    UART_SendString("\r\n=== Temperature Records ===\r\n");
+    
+    for(i = 0; i < record_count; i++)
+    {
+        Flash_ReadData(temp_data, address, 2);
+        
+        // 组合16位数据
+        raw_temp = (temp_data[0] << 8) | temp_data[1];
+        temp_c = ConvertToCelsius(raw_temp);
+        
+        // 显示记录
+        UART_SendString("Record ");
+        SendNumber(i);
+        UART_SendString(": ");
+        SendFloat(temp_c, 3);
+        UART_SendString(" C\r\n");
+        
+        address += 2;
+    }
+    
+    UART_SendString("Total records: ");
+    SendNumber(record_count);
+    UART_SendString("\r\n");
+}
+
+/************************中断服务函数*************************/
+// UART中断服务函数
+void UART_IRQHandler(void)
+{
+    if(LPC_UART->LSR & (1<<0)) { // 接收中断
+        uart_command = LPC_UART->RBR;
+        ProcessUARTCommand();
+    }
+}
+
+// 处理UART命令
+void ProcessUARTCommand(void)
+{
+    switch(uart_command) {
+        case 'r':
+        case 'R':
+            DisplayAllRecords();
+            break;
+        case 'c':
+        case 'C':
+            Flash_EraseChip();
+            flash_address = 0;
+            record_count = 0;
+            UART_SendString("Flash erased and reset\r\n");
+            break;
+        default:
+            UART_SendString("Unknown command. Use: r=read records, c=clear flash\r\n");
+            break;
+    }
+}
+
+// ADC中断服务函数
+void ADC_IRQHandler(void)
+{
+    // 读取AD7通道的转换结果
+    if(LPC_ADC->DR[7] & (1UL << 31)) {
+        adc_value = (LPC_ADC->DR[7] >> 6) & 0x3FF;
+        adc_data_ready = 1;
+    }
+}
+
+// 定时器32_0中断服务函数 - 用于触发ADC转换
+void TIMER32_0_IRQHandler(void)
+{
+    if((LPC_TMR32B0->IR & 0x01) == 0x01) {
+        LPC_TMR32B0->IR = 0x01; // 清除中断标志
+        
+        // 启动ADC转换（软件触发）
+        LPC_ADC->CR |= (1UL << 24);
+    }
+}
+
+// 定时器32_1中断服务函数 - 用于读取LM75温度并存储到Flash
+void TIMER32_1_IRQHandler(void)
+{
+    if((LPC_TMR32B1->IR & 0x01) == 0x01) {
+        LPC_TMR32B1->IR = 0x01; // 清除中断标志
+        
+        // 读取LM75温度
+        int16_t raw_temp = ReadRawTemperature();
+			        // 存储到Flash
+        SaveTemperatureData(raw_temp);
+	last_raw_temp = raw_temp;
+      //  float current_temp = ConvertToCelsius(raw_temp);
+        
+        flash_data_ready = 1;
+        
+    }
+}
+
+
+
+/************************主函数*************************/
+int main(void)
+{
+    // 系统初始化
+    SystemCoreClockUpdate();
+    // 外设初始化
+    UART_Init();
+    ADC_Init();
+    TIMER32B0_Init();  // 用于ADC触发
+    TIMER32B1_Init();  // 用于LM75温度采集和存储
+    Flash_Init();
+    I2C_Init();
+    
+
+    
+    UART_SendString("LPC1114 Temperature Monitoring System Started\r\n");
+    UART_SendString("Mode 1: Timer1 triggers ADC conversion every 1s\r\n");
+    UART_SendString("Mode 2: Timer2 reads LM75 and saves to Flash every 1s\r\n");
+    UART_SendString("Commands: r=read records, c=clear flash\r\n\r\n");
+    
+    // 擦除Flash并初始化
+    Flash_EraseChip();
+    flash_address = 0;
+    record_count = 0;
+    UART_SendString("Flash initialized and ready\r\n");
+    
+    while(1) {
+        // 处理ADC数据
+        if(adc_data_ready && flash_data_ready) {
+            // ADC温度计算和显示
+            UART_SendString("ADC Raw: ");
+            SendNumber(adc_value);
+            UART_SendString(" -> NTC Temp: ");
+            float ntc_temperature = ADC_To_Temperature(adc_value);
+            SendFloat(ntc_temperature, 2);
+            UART_SendString(" C | ");
+            
+            // LM75温度计算和显示
+            float lm75_temperature = ConvertToCelsius(last_raw_temp);
+            UART_SendString("LM75 Temp: ");
+            if(lm75_temperature >= 0) UART_SendString("+");
+            SendFloat(lm75_temperature, 3);
+            UART_SendString(" C");
+            
+            // 显示记录计数
+            UART_SendString(" [Record #");
+            SendNumber(record_count);
+            UART_SendString("]\r\n");
+            
+            // 清空标志，等待下一次数据
+            adc_data_ready = 0;
+            flash_data_ready = 0;
+        }
+        
+        __WFI(); // 等待中断
+    }
+}
